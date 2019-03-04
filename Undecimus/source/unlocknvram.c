@@ -5,10 +5,6 @@
 //  2) Have tfp0 / kernel read|write|alloc
 //  3) Can leak kernel address of mach port
 // then we can fake vtable on IODTNVRAM object
-// async_wake satisfies those requirements
-// however, I wasn't able to actually set or get ANY nvram variable
-// not even userread/userwrite
-// Guess sandboxing won't let to access nvram
 
 #include <stdlib.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -19,9 +15,13 @@
 #include "KernelMemory.h"
 #include "find_port.h"
 
-// from vtable start in bytes
-unsigned VTB_IODTNVRAM__SEARCHNVRAMPROPERTY = 0x590;
-unsigned VTB_IODTNVRAM__GETOFVARIABLEPERM   = 0x558;
+static const size_t max_vtable_size = 0x1000;
+static const size_t kernel_buffer_size = 0x4000;
+
+// it always returns false
+static const uint64_t searchNVRAMProperty = 0x590;
+// 0 corresponds to root only
+static const uint64_t getOFVariablePerm = 0x558;
 
 // convertPropToObject calls getOFVariableType
 // open convertPropToObject, look for first vtable call -- that'd be getOFVariableType
@@ -47,7 +47,8 @@ uint64_t get_iodtnvram_obj(void) {
     return IODTNVRAMObj;
 }
 
-uint64_t orig_vtable = -1;
+uint64_t orig_vtable = 0;
+uint64_t fake_vtable = 0;
 
 int unlocknvram(void) {
     uint64_t obj = get_iodtnvram_obj();
@@ -56,34 +57,18 @@ int unlocknvram(void) {
         return 1;
     }
 
-    uint64_t vtable_start = ReadKernel64(obj);
-
-    orig_vtable = vtable_start;
-
-    uint64_t vtable_end = vtable_start;
-    // Is vtable really guaranteed to end with 0 or was it just a coincidence?..
-    // should we just use some max value instead?
-    while (ReadKernel64(vtable_end) != 0) vtable_end += sizeof(uint64_t);
-
-    uint32_t vtable_len = (uint32_t) (vtable_end - vtable_start);
-
-    // copy vtable to userspace
-    uint64_t *buf = calloc(1, vtable_len);
-    rkbuffer(vtable_start, buf, vtable_len);
-
-    LOG("IODTNVRAM vtable: 0x%llx - 0x%llx", vtable_start, vtable_end);
-
-    for (int i = 0; i != vtable_len; i += sizeof(uint64_t)) {
-        LOG("\t[0x%03x]: 0x%llx", i, buf[i/sizeof(uint64_t)]);
-    }
-
+    orig_vtable = ReadKernel64(obj);
+    
+    uint64_t *buf = calloc(1, max_vtable_size);
+    kread(orig_vtable, buf, max_vtable_size);
+    
     // alter it
-    buf[VTB_IODTNVRAM__GETOFVARIABLEPERM / sizeof(uint64_t)] = \
-        buf[VTB_IODTNVRAM__SEARCHNVRAMPROPERTY / sizeof(uint64_t)];
+    buf[getOFVariablePerm / sizeof(uint64_t)] = \
+        buf[searchNVRAMProperty / sizeof(uint64_t)];
 
     // allocate buffer in kernel and copy it back
-    uint64_t fake_vtable = kmem_alloc_wired(vtable_len);
-    wkbuffer(fake_vtable, buf, vtable_len);
+    fake_vtable = kmem_alloc_wired(kernel_buffer_size);
+    wkbuffer(fake_vtable, buf, kernel_buffer_size);
 
     // replace vtable on IODTNVRAM object
     WriteKernel64(obj, fake_vtable);
@@ -94,7 +79,7 @@ int unlocknvram(void) {
 }
 
 int locknvram(void) {
-    if (orig_vtable == -1) {
+    if (orig_vtable == 0 || fake_vtable == 0) {
         LOG("Trying to lock nvram, but didnt unlock first");
         return -1;
     }
@@ -106,6 +91,7 @@ int locknvram(void) {
     }
     
     WriteKernel64(obj, orig_vtable);
+    kmem_free(fake_vtable, kernel_buffer_size);
 
     LOG("Locked nvram");
     return 0;

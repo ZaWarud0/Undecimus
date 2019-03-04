@@ -27,6 +27,8 @@ typedef struct {
     kptr_t extension_create_file;
     kptr_t extension_add;
     kptr_t extension_release;
+    kptr_t pmap_load_trust_cache;
+    kptr_t kernproc;
 } offsets_t;
 
 extern offsets_t offs;

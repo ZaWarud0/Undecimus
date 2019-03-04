@@ -57,6 +57,7 @@
 #include "v1ntex_offsets.h"
 #include "v1ntex_exploit.h"
 #include "v3ntex_exploit.h"
+#include "lzssdec.h"
 
 @interface NSUserDefaults ()
 - (id)objectForKey:(id)arg1 inDomain:(id)arg2;
@@ -646,6 +647,23 @@ void waitFor(int seconds) {
     }
 }
 
+static void *load_bytes(FILE *obj_file, off_t offset, uint32_t size) {
+    void *buf = calloc(1, size);
+    fseek(obj_file, offset, SEEK_SET);
+    fread(buf, size, 1, obj_file);
+    return buf;
+}
+
+uint32_t find_macho_header(FILE *file) {
+    uint32_t off = 0;
+    uint32_t *magic = load_bytes(file, off, sizeof(uint32_t));
+    while ((*magic & ~1) != 0xFEEDFACE) {
+        off++;
+        magic = load_bytes(file, off, sizeof(uint32_t));
+    }
+    return off - 1;
+}
+
 void jailbreak()
 {
     int rv = 0;
@@ -668,6 +686,7 @@ void jailbreak()
     NSString *temporaryDirectory = NSTemporaryDirectory();
     NSMutableArray *debsToInstall = [NSMutableArray new];
     NSMutableString *status = [NSMutableString string];
+    bool betaFirmware = false;
 #define INSERTSTATUS(x) do { \
     [status appendString:[[NSString alloc] initWithFormat:x]]; \
 } while (false)
@@ -830,7 +849,27 @@ void jailbreak()
         
         LOG("Initializing patchfinder64...");
         SETMESSAGE(NSLocalizedString(@"Failed to initialize patchfinder64.", nil));
-        _assert(init_kernel(kread, kernel_base, NULL) == ERR_SUCCESS, message, true);
+        const char *original_kernel_cache_path = "/System/Library/Caches/com.apple.kernelcaches/kernelcache";
+        const char *decompressed_kernel_cache_path = [homeDirectory stringByAppendingPathComponent:@"Documents/kernelcache.dec"].UTF8String;
+        if (!canRead(decompressed_kernel_cache_path)) {
+            FILE *original_kernel_cache = fopen(original_kernel_cache_path, "rb");
+            _assert(original_kernel_cache != NULL, message, true);
+            uint32_t macho_header_offset = find_macho_header(original_kernel_cache);
+            _assert(macho_header_offset != 0, message, true);
+            char *args[5] = { "lzssdec", "-o", (char *)[NSString stringWithFormat:@"0x%x", macho_header_offset].UTF8String, (char *)original_kernel_cache_path, (char *)decompressed_kernel_cache_path};
+            _assert(lzssdec(5, args) == ERR_SUCCESS, message, true);
+            fclose(original_kernel_cache);
+        }
+        if (init_kernel(NULL, 0, decompressed_kernel_cache_path) != ERR_SUCCESS) {
+            _assert(clean_file(decompressed_kernel_cache_path), message, true);
+            _assert(false, message, true);
+        }
+        if (auth_ptrs) {
+            LOG("Detected authentication pointers.");
+        }
+        if (monolithic_kernel) {
+            LOG("Detected monolithic kernel.");
+        }
         LOG("Successfully initialized patchfinder64.");
     }
     
@@ -843,8 +882,9 @@ void jailbreak()
 #define PF(x) do { \
         SETMESSAGE(NSLocalizedString(@"Failed to find " #x " offset.", nil)); \
         SETOFFSET(x, find_ ##x()); \
-        LOG(#x " = " ADDR " + " ADDR, GETOFFSET(x) - kernel_slide, kernel_slide); \
+        LOG(#x " = " ADDR " + " ADDR, GETOFFSET(x), kernel_slide); \
         _assert(ISADDR(GETOFFSET(x)), message, true); \
+        SETOFFSET(x, GETOFFSET(x) + kernel_slide); \
 } while (false)
         PF(trustcache);
         PF(OSBoolean_True);
@@ -864,7 +904,14 @@ void jailbreak()
             PF(fs_lookup_snapshot_metadata_by_name_and_return_name);
             PF(apfs_jhash_getvnode);
         }
+        if (auth_ptrs) {
+            PF(pmap_load_trust_cache);
+        }
 #undef PF
+        uint64_t kernproc = ReadKernel64(GETOFFSET(kernel_task)) + koffset(KSTRUCT_OFFSET_TASK_BSD_INFO);
+        _assert(ISADDR(kernproc), message, true);
+        SETOFFSET(kernproc, kernproc);
+        LOG("kernproc = " ADDR, GETOFFSET(kernproc) - kernel_slide);
         found_offsets = true;
         LOG("Successfully found offsets.");
     }
@@ -977,7 +1024,7 @@ void jailbreak()
     UPSTAGE();
     
     {
-        if (prefs.overwrite_boot_nonce) {
+        if (prefs.overwrite_boot_nonce && !auth_ptrs) {
             // Unlock nvram.
             
             LOG("Unlocking nvram...");
@@ -985,6 +1032,7 @@ void jailbreak()
             _assert(unlocknvram() == ERR_SUCCESS, message, true);
             LOG("Successfully unlocked nvram.");
             
+            _assert(runCommand("/usr/sbin/nvram", "-p", NULL) == ERR_SUCCESS, message, true);
             const char *bootNonceKey = "com.apple.System.boot-nonce";
             if (runCommand("/usr/sbin/nvram", bootNonceKey, NULL) != ERR_SUCCESS ||
                 strstr(lastSystemOutput.bytes, prefs.boot_nonce) == NULL) {
@@ -996,6 +1044,7 @@ void jailbreak()
                 _assert(runCommand("/usr/sbin/nvram", [NSString stringWithFormat:@"%s=%s", kIONVRAMForceSyncNowPropertyKey, bootNonceKey].UTF8String, NULL) == ERR_SUCCESS, message, true);
                 LOG("Successfully set boot-nonce.");
             }
+            _assert(runCommand("/usr/sbin/nvram", "-p", NULL) == ERR_SUCCESS, message, true);
             
             // Lock nvram.
             
@@ -1033,7 +1082,6 @@ void jailbreak()
         LOG("Logging ECID...");
         SETMESSAGE(NSLocalizedString(@"Failed to log ECID.", nil));
         CFStringRef value = MGCopyAnswer(kMGUniqueChipID);
-        LOG("ECID = %@", value);
         _assert(value != nil, message, true);
         _assert(modifyPlist(prefsFile, ^(id plist) {
             plist[K_ECID] = CFBridgingRelease(value);
@@ -1077,6 +1125,10 @@ void jailbreak()
             }), message, true);
             INSERTSTATUS(NSLocalizedString(@"Enabled Auto Updates.\n", nil));
         }
+    }
+    
+    if (auth_ptrs) {
+        goto out;
     }
     
     UPSTAGE();
@@ -1126,17 +1178,17 @@ void jailbreak()
             
             // Mount system snapshot.
             
-            LOG("Mounting system snapshot...");
-            SETMESSAGE(NSLocalizedString(@"Unable to mount system snapshot.", nil));
-            _assert(!is_mountpoint("/var/MobileSoftwareUpdate/mnt1"),
-                    NSLocalizedString(@"RootFS already mounted, delete OTA file from Settings - Storage if present and reboot.", nil), true);
-            const char *systemSnapshotMountPoint = "/private/var/tmp/jb/mnt1";
-            if (is_mountpoint(systemSnapshotMountPoint)) {
-                _assert(unmount(systemSnapshotMountPoint, MNT_FORCE) == ERR_SUCCESS, message, true);
+            LOG("Mounting rootfs...");
+            SETMESSAGE(NSLocalizedString(@"Unable to mount rootfs.", nil));
+            NSString *invalidRootMessage = NSLocalizedString(@"RootFS already mounted, delete OTA file from Settings - Storage if present and reboot.", nil);
+            _assert(!is_mountpoint("/var/MobileSoftwareUpdate/mnt1"), invalidRootMessage, true);
+            const char *rootFsMountPoint = "/private/var/tmp/jb/mnt1";
+            if (is_mountpoint(rootFsMountPoint)) {
+                _assert(unmount(rootFsMountPoint, MNT_FORCE) == ERR_SUCCESS, message, true);
             }
-            _assert(clean_file(systemSnapshotMountPoint), message, true);
-            _assert(ensure_directory(systemSnapshotMountPoint, 0, 0755), message, true);
-            const char *argv[] = {"/sbin/mount_apfs", thedisk, systemSnapshotMountPoint, NULL};
+            _assert(clean_file(rootFsMountPoint), message, true);
+            _assert(ensure_directory(rootFsMountPoint, 0, 0755), message, true);
+            const char *argv[] = {"/sbin/mount_apfs", thedisk, rootFsMountPoint, NULL};
             _assert(runCommandv(argv[0], 3, argv, ^(pid_t pid) {
                 uint64_t procStructAddr = get_proc_struct_for_pid(pid);
                 LOG("procStructAddr = " ADDR, procStructAddr);
@@ -1144,15 +1196,15 @@ void jailbreak()
                 give_creds_to_process_at_addr(procStructAddr, kernelCredAddr);
             }) == ERR_SUCCESS, message, true);
             _assert(runCommand("/sbin/mount", NULL) == ERR_SUCCESS, message, true);
-            const char *systemSnapshotLaunchdPath = [@(systemSnapshotMountPoint) stringByAppendingPathComponent:@"sbin/launchd"].UTF8String;
+            const char *systemSnapshotLaunchdPath = [@(rootFsMountPoint) stringByAppendingPathComponent:@"sbin/launchd"].UTF8String;
             _assert(waitForFile(systemSnapshotLaunchdPath) == ERR_SUCCESS, message, true);
-            LOG("Successfully mounted system snapshot.");
+            LOG("Successfully mounted rootfs.");
             
             // Rename system snapshot.
             
             LOG("Renaming system snapshot...");
             SETMESSAGE(NSLocalizedString(@"Unable to rename system snapshot. Delete OTA file from Settings - Storage if present and reboot.", nil));
-            rootfd = open(systemSnapshotMountPoint, O_RDONLY);
+            rootfd = open(rootFsMountPoint, O_RDONLY);
             _assert(rootfd > 0, message, true);
             snapshots = snapshot_list(rootfd);
             _assert(snapshots != NULL, message, true);
@@ -1162,6 +1214,18 @@ void jailbreak()
             }
             free(snapshots);
             snapshots = NULL;
+            NSString *systemVersionPlist = @"/System/Library/CoreServices/SystemVersion.plist";
+            NSString *rootSystemVersionPlist = [@(rootFsMountPoint) stringByAppendingPathComponent:systemVersionPlist];
+            _assert(rootSystemVersionPlist != nil, message, true);
+            NSDictionary *snapshotSystemVersion = [NSDictionary dictionaryWithContentsOfFile:systemVersionPlist];
+            _assert(snapshotSystemVersion != nil, message, true);
+            NSDictionary *rootfsSystemVersion = [NSDictionary dictionaryWithContentsOfFile:rootSystemVersionPlist];
+            _assert(rootfsSystemVersion != nil, message, true);
+            if (![rootfsSystemVersion[@"ProductBuildVersion"] isEqualToString:snapshotSystemVersion[@"ProductBuildVersion"]]) {
+                LOG("snapshot VersionPlist: %@", snapshotSystemVersion);
+                LOG("rootfs VersionPlist: %@", rootfsSystemVersion);
+                _assert("BuildVersions match"==NULL, invalidRootMessage, true);
+            }
             const char *test_snapshot = "test-snapshot";
             _assert(fs_snapshot_create(rootfd, test_snapshot, 0) == ERR_SUCCESS, message, true);
             _assert(fs_snapshot_delete(rootfd, test_snapshot, 0) == ERR_SUCCESS, message, true);
@@ -1432,8 +1496,27 @@ void jailbreak()
             [debsToInstall addObject:substrateDeb];
         }
         
-        NSArray *resourcesPkgs = [@[@"com.ps.letmeblock", @"com.parrotgeek.nobetaalert"] arrayByAddingObjectsFromArray:resolveDepsForPkg(@"jailbreak-resources", true)];
+        char *osversion = NULL;
+        size_t size = 0;
+        _assert(sysctlbyname("kern.osversion", NULL, &size, NULL, 0) == ERR_SUCCESS, message, true);
+        osversion = malloc(size);
+        _assert(osversion != NULL, message, true);
+        _assert(sysctlbyname("kern.osversion", osversion, &size, NULL, 0) == ERR_SUCCESS, message, true);
+        if (strlen(osversion) > 6) {
+            betaFirmware = true;
+            LOG("Detected beta firmware.");
+        }
+        free(osversion);
+        osversion = NULL;
+        NSArray *resourcesPkgs = resolveDepsForPkg(@"jailbreak-resources", true);
         _assert(resourcesPkgs != nil, message, true);
+        if (betaFirmware) {
+            resourcesPkgs = [@[@"com.parrotgeek.nobetaalert"] arrayByAddingObjectsFromArray:resourcesPkgs];
+        }
+        if (kCFCoreFoundationVersionNumber >= 1535.12) {
+            resourcesPkgs = [@[@"com.ps.letmeblock"] arrayByAddingObjectsFromArray:resourcesPkgs];
+        }
+
         NSMutableArray *pkgsToRepair = [NSMutableArray new];
         LOG("Resource Pkgs: \"%@\".", resourcesPkgs);
         for (NSString *pkg in resourcesPkgs) {
@@ -1459,6 +1542,13 @@ void jailbreak()
             [debsToInstall addObjectsFromArray:debsToRepair];
         }
         
+        // Ensure ldid's symlink isn't missing
+        // (it's created by update-alternatives which may not have been called yet)
+        if (access("/usr/bin/ldid", F_OK) != ERR_SUCCESS) {
+            _assert(access("/usr/libexec/ldid", F_OK) == ERR_SUCCESS, message, true);
+            _assert(ensure_symlink("../libexec/ldid", "/usr/bin/ldid"), message, true);
+        }
+
         // These don't need to lay around
         clean_file("/Library/LaunchDaemons/jailbreakd.plist");
         clean_file("/jb/jailbreakd.plist");
@@ -1504,7 +1594,6 @@ void jailbreak()
         dictionary[@"VfsContextCurrent"] = ADDRSTRING(GETOFFSET(vfs_context_current));
         dictionary[@"VnodeLookup"] = ADDRSTRING(GETOFFSET(vnode_lookup));
         dictionary[@"VnodePut"] = ADDRSTRING(GETOFFSET(vnode_put));
-        dictionary[@"KernProc"] = ADDRSTRING(ReadKernel64(GETOFFSET(kernel_task))  + koffset(KSTRUCT_OFFSET_TASK_BSD_INFO));
         dictionary[@"KernelTask"] = ADDRSTRING(GETOFFSET(kernel_task));
         dictionary[@"Shenanigans"] = ADDRSTRING(GETOFFSET(shenanigans));
         dictionary[@"LckMtxLock"] = ADDRSTRING(GETOFFSET(lck_mtx_lock));
@@ -1512,6 +1601,7 @@ void jailbreak()
         dictionary[@"VnodeGetSnapshot"] = ADDRSTRING(GETOFFSET(vnode_get_snapshot));
         dictionary[@"FsLookupSnapshotMetadataByNameAndReturnName"] = ADDRSTRING(GETOFFSET(fs_lookup_snapshot_metadata_by_name_and_return_name));
         dictionary[@"APFSJhashGetVnode"] = ADDRSTRING(GETOFFSET(apfs_jhash_getvnode));
+        dictionary[@"KernProc"] = ADDRSTRING(GETOFFSET(kernproc));
         if (![[NSMutableDictionary dictionaryWithContentsOfFile:offsetsFile] isEqual:dictionary]) {
             // Log offsets.
             
@@ -1631,6 +1721,11 @@ void jailbreak()
             _assert(removePkg("science.xnu.undecimus.resources", true), message, true);
         }
         
+        if (pkgIsInstalled("jailbreak-resources-with-cert")) {
+            LOG("Removing resources-with-cert...");
+            _assert(removePkg("jailbreak-resources-with-cert", true), message, true);
+        }
+            
         if ((pkgIsInstalled("apt7") && compareInstalledVersion("apt7", "lt", "1:0")) ||
             (pkgIsInstalled("apt7-lib") && compareInstalledVersion("apt7-lib", "lt", "1:0")) ||
             (pkgIsInstalled("apt7-key") && compareInstalledVersion("apt7-key", "lt", "1:0"))
@@ -1698,6 +1793,17 @@ void jailbreak()
             }
             _assert(aptInstall(@[@"mobilesubstrate"]), message, true);
         }
+        if (!betaFirmware) {
+            if (pkgIsInstalled("com.parrotgeek.nobetaalert")) {
+                _assert(removePkg("com.parrotgeek.nobetaalert", true), message, true);
+            }
+        }
+        if (!(kCFCoreFoundationVersionNumber >= 1535.12)) {
+            if (pkgIsInstalled("com.ps.letmeblock")) {
+                _assert(removePkg("com.ps.letmeblock", true), message, true);
+            }
+        }
+        
         NSData *file_data = [[NSString stringWithFormat:@"%f\n", kCFCoreFoundationVersionNumber] dataUsingEncoding:NSUTF8StringEncoding];
         if (![[NSData dataWithContentsOfFile:@"/.installed_unc0ver"] isEqual:file_data]) {
             _assert(clean_file("/.installed_unc0ver"), message, true);
@@ -1705,6 +1811,8 @@ void jailbreak()
         }
         
         // Make sure everything's at least as new as what we bundled
+        rv = system("dpkg --configure -a");
+        _assert(WEXITSTATUS(rv) == ERR_SUCCESS, message, true);
         _assert(aptUpgrade(), message, true);
         
         clean_file("/jb/tar");
@@ -1992,7 +2100,6 @@ void jailbreak()
             LOG("Running uicache...");
             SETMESSAGE(NSLocalizedString(@"Failed to run uicache.", nil));
             _assert(runCommand("/usr/bin/uicache", NULL) == ERR_SUCCESS, message, true);
-            waitFor(2); // Don't remove this
             prefs.run_uicache = false;
             _assert(modifyPlist(prefsFile, ^(id plist) {
                 plist[K_REFRESH_ICON_CACHE] = @NO;
@@ -2016,8 +2123,6 @@ void jailbreak()
         }
     }
     
-    waitFor(2); // Don't remove this
-    
     UPSTAGE();
     
     {
@@ -2028,18 +2133,15 @@ void jailbreak()
             SETMESSAGE(NSLocalizedString(@"Failed to load tweaks.", nil));
             if (prefs.reload_system_daemons) {
                 rv = system("nohup bash -c \""
-                             "sleep 1 ;"
                              "launchctl unload /System/Library/LaunchDaemons/com.apple.backboardd.plist && "
-                             "rm -rf /var/root/Library/Caches/com.apple.coresymbolicationd && "
                              "sleep 2 && "
                              "ldrestart ;"
                              "launchctl load /System/Library/LaunchDaemons/com.apple.backboardd.plist"
                              "\" >/dev/null 2>&1 &");
             } else {
                 rv = system("nohup bash -c \""
-                             "sleep 1 ;"
-                             "launchctl stop com.apple.backboardd ;"
-                             "launchctl stop com.apple.mDNSResponder"
+                             "launchctl stop com.apple.mDNSResponder ;"
+                             "launchctl stop com.apple.backboardd"
                              "\" >/dev/null 2>&1 &");
             }
             _assert(WEXITSTATUS(rv) == ERR_SUCCESS, message, true);
@@ -2050,9 +2152,6 @@ void jailbreak()
     }
 out:
     STATUS(NSLocalizedString(@"Jailbroken", nil), false, false);
-    LOG("Dropping kernel credentials...");
-    give_creds_to_process_at_addr(myProcAddr, myOriginalCredAddr);
-    WriteKernel64(GETOFFSET(shenanigans), Shenanigans);
     showAlert(@"Jailbreak Completed", [NSString stringWithFormat:@"%@\n\n%@\n%@", NSLocalizedString(@"Jailbreak Completed with Status:", nil), status, NSLocalizedString(prefs.exploit == v3ntex_exploit && !usedPersistedKernelTaskPort ? @"The device will now respring." : @"The app will now exit.", nil)], true, false);
     if (sharedController.canExit) {
         if (prefs.exploit == v3ntex_exploit && !usedPersistedKernelTaskPort) {
@@ -2067,6 +2166,7 @@ out:
 
 - (IBAction)tappedOnJailbreak:(id)sender
 {
+    STATUS(NSLocalizedString(@"Jailbreak", nil), false, false);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0ul), ^{
         _assert(bundledResources != nil, NSLocalizedString(@"Bundled Resources version missing.", nil), true);
         if (!jailbreakSupported()) {
